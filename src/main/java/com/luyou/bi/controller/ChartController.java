@@ -9,6 +9,7 @@ import com.luyou.bi.common.BaseResponse;
 import com.luyou.bi.common.DeleteRequest;
 import com.luyou.bi.common.ErrorCode;
 import com.luyou.bi.common.ResultUtils;
+import com.luyou.bi.constant.CommonConstant;
 import com.luyou.bi.constant.GenChartStatusConstant;
 import com.luyou.bi.constant.UserConstant;
 import com.luyou.bi.exception.BusinessException;
@@ -22,6 +23,7 @@ import com.luyou.bi.model.vo.BiResponse;
 import com.luyou.bi.service.ChartService;
 import com.luyou.bi.service.UserService;
 import com.luyou.bi.utils.ExcelUtils;
+import com.luyou.bi.utils.SqlUtils;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.BeanUtils;
@@ -229,12 +231,17 @@ public class ChartController {
         String goal = chartQueryRequest.getGoal();
         String chartType = chartQueryRequest.getChartType();
         Long userId = chartQueryRequest.getUserId();
+        String sortField = chartQueryRequest.getSortField();
+        String sortOrder = chartQueryRequest.getSortOrder();
 
         queryWrapper.eq(id != null && id > 0, "id", id);
         queryWrapper.like(StringUtils.isNotBlank(name), "name", name);
         queryWrapper.eq(StringUtils.isNotBlank(goal), "goal", goal);
         queryWrapper.eq(StringUtils.isNotBlank(chartType), "chartType", chartType);
         queryWrapper.eq(ObjectUtils.isNotEmpty(userId), "userId", userId);
+        queryWrapper.orderBy(SqlUtils.validSortField(sortField), sortOrder.equals(CommonConstant.SORT_ORDER_ASC),
+                sortField);
+
         return queryWrapper;
     }
 
