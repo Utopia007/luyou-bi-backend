@@ -9,6 +9,7 @@ import com.luyou.bi.common.BaseResponse;
 import com.luyou.bi.common.DeleteRequest;
 import com.luyou.bi.common.ErrorCode;
 import com.luyou.bi.common.ResultUtils;
+import com.luyou.bi.constant.GenChartStatusConstant;
 import com.luyou.bi.constant.UserConstant;
 import com.luyou.bi.exception.BusinessException;
 import com.luyou.bi.exception.ThrowUtils;
@@ -31,6 +32,8 @@ import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ThreadPoolExecutor;
 
 @RestController
 @RequestMapping("chart")
@@ -48,6 +51,9 @@ public class ChartController {
 
     @Resource
     private RedisLimitManager redisLimitManager;
+
+    @Resource
+    private ThreadPoolExecutor threadPoolExecutor;
 
     /**
      * 创建
@@ -233,7 +239,7 @@ public class ChartController {
     }
 
     /**
-     * 智能分析
+     * 智能分析 (同步)
      *
      * @param multipartFile
      * @param genChartByAiRequest
@@ -318,6 +324,134 @@ public class ChartController {
         biResponse.setGenResult(genResult);
         biResponse.setChartId(chart.getId());
         return ResultUtils.success(biResponse);
+    }
+
+    /**
+     * 智能分析 (异步)
+     *
+     * @param multipartFile
+     * @param genChartByAiRequest
+     * @param request
+     * @return
+     */
+    @PostMapping("/gen/async")
+    public BaseResponse<BiResponse> genChartByAiAsync(@RequestPart("file") MultipartFile multipartFile,
+                                                 GenChartByAiRequest genChartByAiRequest, HttpServletRequest request) {
+        String name = genChartByAiRequest.getName();
+        String goal = genChartByAiRequest.getGoal();
+        String chartType = genChartByAiRequest.getChartType();
+
+        // 校验
+        // 校验文件
+        String originalFilename = multipartFile.getOriginalFilename();
+        long size = multipartFile.getSize();
+        final int ONE_MB = 1024 * 1024;
+        ThrowUtils.throwIf(size > ONE_MB, ErrorCode.PARAMS_ERROR, "文件大小不能超过 1M");
+        String suffix = FileUtil.getSuffix(originalFilename);
+        final List<String> validFileSuffixList = Arrays.asList("xls", "xlsx");
+        ThrowUtils.throwIf(!validFileSuffixList.contains(suffix), ErrorCode.PARAMS_ERROR, "不支持该类型文件");
+        // 如果分析目标为空，抛出请求参数异常，并给出提示
+        ThrowUtils.throwIf(StringUtils.isBlank(goal), ErrorCode.PARAMS_ERROR, "目标为空");
+        // 如果名称不为空，但是长度大于100，抛出异常并给出提示
+        ThrowUtils.throwIf(StringUtils.isNotBlank(name) && name.length() > 100, ErrorCode.PARAMS_ERROR, "名称过长");
+        // request（登录才能使用）
+        User loginUser = userService.getLoginUser(request);
+
+        // 限流判断
+        redisLimitManager.doRateLimit("gen:chart:" + loginUser.getId());
+
+        // 指定智能BI分析模型
+        long biModelId = 1813497699319611393L;
+
+        /*
+        用户的输入(参考)
+          分析需求：
+          请使用xxx图表类型分析网站用户的增长情况
+          原始数据：
+          日期,用户数
+          1号,10
+          2号,20
+          3号,30
+         */
+        // 用户输入
+        StringBuilder userInput = new StringBuilder();
+        userInput.append("分析需求:").append("\n");
+        // 拼接分析目标
+        String userGoal = goal;
+        if (StringUtils.isNotBlank(chartType)) {
+            // 将分析目标拼接上 ”请使用“ + 图表类型
+            userGoal = "请使用" + chartType + userGoal;
+        }
+        userInput.append(userGoal).append("\n");
+        userInput.append("原始数据:").append("\n");
+        // 压缩后的数据（CSV）
+        String csvData = ExcelUtils.excelToCsv(multipartFile);
+        userInput.append(csvData).append("\n");
+
+        // 先把图表保存到数据库中
+        Chart chart = new Chart();
+        boolean saveResult = false;
+        try {
+            chart.setName(name);
+            chart.setGoal(goal);
+            chart.setChartData(csvData);
+            chart.setChartType(chartType);
+            chart.setStatus(GenChartStatusConstant.WAIT);
+            chart.setUserId(loginUser.getId());
+            saveResult = chartService.save(chart);
+        } catch (Exception e){
+            ThrowUtils.throwIf(!saveResult, ErrorCode.SYSTEM_ERROR, "图表保存失败");
+        }
+
+        // 异步执行任务
+        CompletableFuture.runAsync(() -> {
+            Chart updateChart = new Chart();
+            updateChart.setId(chart.getId());
+            updateChart.setStatus(GenChartStatusConstant.RUNNING);
+            boolean b = chartService.updateById(updateChart);
+            if (!b) {
+                handleChartUpdateError(chart.getId(), "更新图表执行中状态失败");
+                return;
+            }
+            // 调用AI
+            // 拿到返回结果
+            String result = aiManager.doChat(biModelId, userInput.toString());
+            // 对返回结果做拆分
+            String[] splits = result.split("【【【【【");
+            if (splits.length < 3) {
+                throw new BusinessException(ErrorCode.SYSTEM_ERROR, "AI生成错误");
+            }
+            String genChart = splits[1].trim();
+            String genResult = splits[2].trim();
+            // 将生成的图表json和分析信息保存到数据库，更新状态信息
+            Chart resChart = new Chart();
+            resChart.setId(chart.getId());
+            resChart.setGenChart(genChart);
+            resChart.setGenResult(genResult);
+            resChart.setStatus(GenChartStatusConstant.SUCCEED);
+            boolean updatedById = chartService.updateById(resChart);
+            if (!updatedById) {
+                handleChartUpdateError(chart.getId(), "更新图表成功状态失败");
+            }
+
+        }, threadPoolExecutor);
+        BiResponse biResponse = new BiResponse();
+        biResponse.setChartId(chart.getId());
+        return ResultUtils.success(biResponse);
+    }
+
+    /**
+     * 更新图表状态失败处理
+     * @param id
+     * @param execMessage
+     */
+    private void handleChartUpdateError(Long id, String execMessage) {
+        Chart handleErrorChart = new Chart();
+        handleErrorChart.setId(id);
+        handleErrorChart.setExecMessage(execMessage);
+        handleErrorChart.setStatus(GenChartStatusConstant.FAILED);
+        boolean b = chartService.updateById(handleErrorChart);
+        ThrowUtils.throwIf(b, ErrorCode.SYSTEM_ERROR, "更新图表状态失败处理失败");
     }
 
 
