@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.ObjectUtils;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.luyou.bi.annotation.AuthCheck;
+import com.luyou.bi.bizmq.BIMessageProducer;
 import com.luyou.bi.common.BaseResponse;
 import com.luyou.bi.common.DeleteRequest;
 import com.luyou.bi.common.ErrorCode;
@@ -56,6 +57,9 @@ public class ChartController {
 
     @Resource
     private ThreadPoolExecutor threadPoolExecutor;
+
+    @Resource
+    private BIMessageProducer biMessageProducer;
 
     /**
      * 创建
@@ -306,6 +310,7 @@ public class ChartController {
         // 压缩后的数据（CSV）
         String csvData = ExcelUtils.excelToCsv(multipartFile);
         userInput.append(csvData).append("\n");
+        // TODO guava retrying重试机制（参考lurpc）
         // 拿到返回结果
         String result = aiManager.doChat(biModelId, userInput.toString());
         // 对返回结果做拆分
@@ -343,7 +348,7 @@ public class ChartController {
      */
     @PostMapping("/gen/async")
     public BaseResponse<BiResponse> genChartByAiAsync(@RequestPart("file") MultipartFile multipartFile,
-                                                 GenChartByAiRequest genChartByAiRequest, HttpServletRequest request) {
+                                                      GenChartByAiRequest genChartByAiRequest, HttpServletRequest request) {
         String name = genChartByAiRequest.getName();
         String goal = genChartByAiRequest.getGoal();
         String chartType = genChartByAiRequest.getChartType();
@@ -406,7 +411,7 @@ public class ChartController {
             chart.setStatus(GenChartStatusConstant.WAIT);
             chart.setUserId(loginUser.getId());
             saveResult = chartService.save(chart);
-        } catch (Exception e){
+        } catch (Exception e) {
             ThrowUtils.throwIf(!saveResult, ErrorCode.SYSTEM_ERROR, "图表保存失败");
         }
 
@@ -440,7 +445,6 @@ public class ChartController {
             if (!updatedById) {
                 handleChartUpdateError(chart.getId(), "更新图表成功状态失败");
             }
-
         }, threadPoolExecutor);
         BiResponse biResponse = new BiResponse();
         biResponse.setChartId(chart.getId());
@@ -448,7 +452,88 @@ public class ChartController {
     }
 
     /**
+     * 智能分析 (消息队列)
+     *
+     * @param multipartFile
+     * @param genChartByAiRequest
+     * @param request
+     * @return
+     */
+    @PostMapping("/gen/async/mq")
+    public BaseResponse<BiResponse> genChartByAiAsyncMq(@RequestPart("file") MultipartFile multipartFile,
+                                                        GenChartByAiRequest genChartByAiRequest, HttpServletRequest request) {
+        String name = genChartByAiRequest.getName();
+        String goal = genChartByAiRequest.getGoal();
+        String chartType = genChartByAiRequest.getChartType();
+
+        // 校验
+        // 校验文件
+        String originalFilename = multipartFile.getOriginalFilename();
+        long size = multipartFile.getSize();
+        final int ONE_MB = 1024 * 1024;
+        ThrowUtils.throwIf(size > ONE_MB, ErrorCode.PARAMS_ERROR, "文件大小不能超过 1M");
+        String suffix = FileUtil.getSuffix(originalFilename);
+        final List<String> validFileSuffixList = Arrays.asList("xls", "xlsx");
+        ThrowUtils.throwIf(!validFileSuffixList.contains(suffix), ErrorCode.PARAMS_ERROR, "不支持该类型文件");
+        // 如果分析目标为空，抛出请求参数异常，并给出提示
+        ThrowUtils.throwIf(StringUtils.isBlank(goal), ErrorCode.PARAMS_ERROR, "目标为空");
+        // 如果名称不为空，但是长度大于100，抛出异常并给出提示
+        ThrowUtils.throwIf(StringUtils.isNotBlank(name) && name.length() > 100, ErrorCode.PARAMS_ERROR, "名称过长");
+        // request（登录才能使用）
+        User loginUser = userService.getLoginUser(request);
+
+        // 限流判断
+        redisLimitManager.doRateLimit("gen:chart:" + loginUser.getId());
+
+        // 指定智能BI分析模型
+        long biModelId = 1813497699319611393L;
+
+        /*
+        用户的输入(参考)
+          分析需求：
+          请使用xxx图表类型分析网站用户的增长情况
+          原始数据：
+          日期,用户数
+          1号,10
+          2号,20
+          3号,30
+         */
+        // 用户输入
+        StringBuilder userInput = new StringBuilder();
+        userInput.append("分析需求:").append("\n");
+        // 拼接分析目标
+        String userGoal = goal;
+        if (StringUtils.isNotBlank(chartType)) {
+            // 将分析目标拼接上 ”请使用“ + 图表类型
+            userGoal = "请使用" + chartType + userGoal;
+        }
+        userInput.append(userGoal).append("\n");
+        userInput.append("原始数据:").append("\n");
+        // 压缩后的数据（CSV）
+        String csvData = ExcelUtils.excelToCsv(multipartFile);
+        userInput.append(csvData).append("\n");
+
+        // 先把图表保存到数据库中
+        Chart chart = new Chart();
+        chart.setName(name);
+        chart.setGoal(goal);
+        chart.setChartData(csvData);
+        chart.setChartType(chartType);
+        chart.setStatus(GenChartStatusConstant.WAIT);
+        chart.setUserId(loginUser.getId());
+        boolean saveResult = chartService.save(chart);
+        ThrowUtils.throwIf(!saveResult, ErrorCode.SYSTEM_ERROR, "图表保存失败");
+        Long chartId = chart.getId();
+        biMessageProducer.sendMessage(chartId.toString());
+
+        BiResponse biResponse = new BiResponse();
+        biResponse.setChartId(chart.getId());
+        return ResultUtils.success(biResponse);
+    }
+
+    /**
      * 更新图表状态失败处理
+     *
      * @param id
      * @param execMessage
      */
